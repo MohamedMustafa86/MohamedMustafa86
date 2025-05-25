@@ -1,2 +1,2 @@
 - 👋 Hi, I’m @MohamedMustafa
-- 👀 I’m working now on a financial app
+- 👀 I’m working now on a financial app. 
