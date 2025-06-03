@@ -1,0 +1,401 @@
+import os
+import re
+import string
+import datetime
+import logging
+import urllib.request
+import nltk
+from nltk.corpus import stopwords
+
+# تأكد من تحميل بيانات NLTK المطلوبة
+try:
+    nltk.data.find('corpora/stopwords')
+except nltk.downloader.DownloadError:
+    nltk.download('stopwords')
+    nltk.download('punkt')
+
+# لتثبيت FastText و Transformers و Flask و Gunicorn و python-dotenv و pymongo و yake
+# قم بتشغيل:
+# pip install fasttext transformers flask gunicorn python-dotenv pymongo yake torch sentencepiece
+
+# -----------------------------------------------------------------------------
+# 1. إعدادات المشروع (Configuration)
+# -----------------------------------------------------------------------------
+# استخدام مكتبة dotenv لتحميل المتغيرات البيئية من ملف .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    logging.warning("python-dotenv not found. Environment variables must be set manually.")
+
+# إعدادات قاعدة البيانات MongoDB
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
+DB_NAME = os.getenv('DB_NAME', 'customer_feedback_db')
+COLLECTION_NAME = os.getenv('COLLECTION_NAME', 'comments')
+
+# مسار نموذج FastText لكشف اللغة
+FASTTEXT_MODEL_PATH = os.getenv('FASTTEXT_MODEL_PATH', 'lid.176.bin')
+
+# معرفات النماذج المحملة مسبقًا من Hugging Face لتحليل المشاعر
+SENTIMENT_MODELS = {
+    'ar': 'UBC-NLP/MARBERT',
+    'en': 'distilbert-base-uncased-finetuned-sst-2-english',
+    'ur': 'urduhack/urdu-bert',
+    'tl': 'jcblaise/roberta-tagalog',
+    'multilingual': 'xlm-roberta-base' # نموذج متعدد اللغات كخيار احتياطي
+}
+
+# -----------------------------------------------------------------------------
+# 2. وحدة إدارة قاعدة البيانات (MongoDBManager)
+# -----------------------------------------------------------------------------
+from pymongo import MongoClient
+
+class MongoDBManager:
+    def __init__(self):
+        try:
+            self.client = MongoClient(MONGO_URI)
+            self.db = self.client[DB_NAME]
+            self.collection = self.db[COLLECTION_NAME]
+            logging.info("MongoDB connection initialized successfully.")
+        except Exception as e:
+            logging.error(f"Failed to connect to MongoDB at {MONGO_URI}: {e}")
+            self.client = None
+            self.db = None
+            self.collection = None
+
+    def insert_comment_analysis(self, analysis_result):
+        if not self.collection:
+            logging.error("MongoDB collection is not initialized. Cannot insert data.")
+            return False
+        
+        analysis_result['timestamp'] = datetime.datetime.now()
+        try:
+            self.collection.insert_one(analysis_result)
+            return True
+        except Exception as e:
+            logging.error(f"Error inserting document into MongoDB: {e}")
+            return False
+
+    def get_all_comments(self):
+        if not self.collection:
+            logging.error("MongoDB collection is not initialized. Cannot retrieve data.")
+            return []
+        try:
+            return list(self.collection.find({}).sort('timestamp', -1))
+        except Exception as e:
+            logging.error(f"Error retrieving documents from MongoDB: {e}")
+            return []
+
+    def close_connection(self):
+        if self.client:
+            self.client.close()
+            logging.info("MongoDB connection closed.")
+
+# -----------------------------------------------------------------------------
+# 3. وحدة معالجة النصوص (Preprocessing Utilities)
+# -----------------------------------------------------------------------------
+ARABIC_STOPWORDS = set(stopwords.words('arabic'))
+ENGLISH_STOPWORDS = set(stopwords.words('english'))
+
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\@\w+|\#', '', text)
+    # إزالة علامات الترقيم (باستثناء المسافات والأحرف)
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = re.sub(r'\s+', ' ', text).strip() # استبدال مسافات متعددة بمسافة واحدة
+    return text
+
+def remove_stopwords(text, lang):
+    words = text.split()
+    if lang == 'ar':
+        filtered_words = [word for word in words if word not in ARABIC_STOPWORDS]
+    elif lang == 'en':
+        filtered_words = [word for word in words if word not in ENGLISH_STOPWORDS]
+    else:
+        filtered_words = words
+    return ' '.join(filtered_words)
+
+def normalize_arabic_dialect(text):
+    dialect_map = {
+        'مب': 'ليس', 'مش': 'ليس', 'ماشي': 'ليس',
+        'وايد': 'كثير', 'هلبا': 'كثير', 'برشا': 'كثير',
+        'حياك': 'أهلاً بك', 'يا هلا': 'أهلاً وسهلاً',
+        'جداً': 'كثير',
+        'يزاك الله خير': 'جزاك الله خير',
+        'عيل': 'إذن',
+        'رمسه': 'تكلم',
+        'ليش': 'لماذا', 'شو': 'ماذا', 'ويش': 'ماذا',
+        'زين': 'جيد', 'خوش': 'جيد', 'منيح': 'جيد', # تحسين لكلمات بمعنى "جيد"
+        'مو': 'ليس', # مصرية
+        'إيه': 'نعم', # مصرية
+        'بصراحة': 'بصراحة', # كلمة يمكن ان تؤثر على المشاعر
+        # يمكن إضافة المزيد بناءً على تحليل البيانات الفعلية واللهجات الشائعة في الإمارات
+    }
+    words = text.split()
+    normalized_words = [dialect_map.get(word, word) for word in words]
+    return ' '.join(normalized_words)
+
+def segment_hybrid_comment(text, lang_detector):
+    """
+    يقوم بتقسيم التعليق الهجين إلى أجزاء بناءً على اللغة المكتشفة.
+    """
+    tokens = nltk.word_tokenize(text)
+    segments = []
+    current_segment_tokens = []
+    current_segment_lang = None
+
+    for token in tokens:
+        # FastText قد لا يكون دقيقًا جدًا للكلمات القصيرة
+        # لذا نضيف تحسينات يدوية أو نعتمد على السياق/النماذج الأكبر
+        token_lang_pred = lang_detector.predict(token, k=1)
+        token_lang = token_lang_pred[0][0].replace('__label__', '') if token_lang_pred and len(token) > 2 else 'und'
+
+        # تحسينات لكشف الكلمات الإنجليزية الشائعة المختلطة
+        if re.match(r'^[a-zA-Z]+$', token) and len(token) > 1: # إذا كانت الكلمة تتكون فقط من أحرف إنجليزية
+            if token_lang != 'en' and token.lower() in ["nice", "great", "good", "bad", "excellent", "service", "food", "staff", "very", "super", "slow", "fast"]:
+                token_lang = 'en'
+            elif token_lang == 'und': # إذا لم يتمكن FastText من الكشف وأحرفها إنجليزية
+                token_lang = 'en'
+        
+        # إذا لم يتم الكشف عن لغة أو كانت الكلمة قصيرة، حافظ على السياق السابق
+        if token_lang == 'und' and current_segment_lang:
+            token_lang = current_segment_lang
+
+        if not current_segment_tokens:
+            current_segment_tokens.append(token)
+            current_segment_lang = token_lang
+        elif token_lang == current_segment_lang or token_lang == 'und': # استمر في نفس المقطع
+            current_segment_tokens.append(token)
+        else: # تغيير اللغة أو الانتقال إلى لغة محددة
+            segments.append({'text': ' '.join(current_segment_tokens), 'lang': current_segment_lang})
+            current_segment_tokens = [token]
+            current_segment_lang = token_lang
+    
+    if current_segment_tokens:
+        segments.append({'text': ' '.join(current_segment_tokens), 'lang': current_segment_lang})
+    
+    return segments
+
+# -----------------------------------------------------------------------------
+# 4. وحدة استخراج الكلمات المفتاحية (Keyword Extraction)
+# -----------------------------------------------------------------------------
+from yake import KeywordExtractor
+
+def extract_keywords(text, lang='en', n_keywords=5):
+    # YAKE! يدعم لغات متعددة
+    # lan: لغة النص
+    # n: أقصى عدد من الكلمات التي تكون الكلمة المفتاحية (n-gram)
+    # top: عدد الكلمات المفتاحية المراد استخراجها
+    try:
+        kw_extractor = KeywordExtractor(lan=lang, n=1, top=n_keywords)
+        keywords = kw_extractor.extract_keywords(text)
+        return [kw for kw, score in keywords]
+    except Exception as e:
+        logging.error(f"Error extracting keywords for language {lang}: {e}")
+        return []
+
+# -----------------------------------------------------------------------------
+# 5. تطبيق Flask الرئيسي (main.py)
+# -----------------------------------------------------------------------------
+from flask import Flask, request, jsonify, render_template
+from transformers import pipeline
+import fasttext
+
+app = Flask(__name__)
+
+# إعدادات التسجيل
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# تحميل نماذج كشف اللغة والمشاعر مرة واحدة عند بدء التطبيق
+lang_model = None
+sentiment_pipelines = {}
+
+def load_models():
+    global lang_model, sentiment_pipelines
+    
+    # تنزيل FastText model إذا لم يكن موجوداً
+    if not os.path.exists(FASTTEXT_MODEL_PATH):
+        logging.warning(f"FastText model '{FASTTEXT_MODEL_PATH}' not found. Attempting to download...")
+        try:
+            urllib.request.urlretrieve("https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin", FASTTEXT_MODEL_PATH)
+            logging.info("FastText model downloaded successfully.")
+        except Exception as e:
+            logging.error(f"Failed to download FastText model: {e}. Please download it manually to {FASTTEXT_MODEL_PATH}.")
+            exit(1) # الخروج إذا لم يتمكن من تحميل نموذج اللغة
+    
+    try:
+        lang_model = fasttext.load_model(FASTTEXT_MODEL_PATH)
+        logging.info(f"FastText model loaded from {FASTTEXT_MODEL_PATH}")
+    except ValueError as e:
+        logging.error(f"Error loading FastText model: {e}. Ensure it's a valid FastText model.")
+        exit(1)
+
+    for lang, model_id in SENTIMENT_MODELS.items():
+        try:
+            # device=-1 لضمان استخدام CPU. غيّر إلى 0 أو 1 لـ GPU إذا كان متاحًا ومطلوبًا.
+            sentiment_pipelines[lang] = pipeline('text-classification', model=model_id, device=-1)
+            logging.info(f"Loaded sentiment model for {lang}: {model_id}")
+        except Exception as e:
+            logging.error(f"Error loading sentiment model for {lang} ({model_id}): {e}. This language might not be fully supported.")
+            # لا تخرج هنا، فقط قم بتسجيل الخطأ واستمر بدون هذا النموذج
+
+# تهيئة قاعدة البيانات
+db_manager = MongoDBManager()
+
+# -----------------------------------------------------------------------------
+# 6. دالة تحليل التعليق الفردي
+# -----------------------------------------------------------------------------
+def analyze_single_comment_full(original_text):
+    """
+    تحلل تعليق عميل واحد وتستخرج اللغة والمشاعر والكلمات المفتاحية.
+    تتعامل مع التعليقات الهجينة واللهجات العربية.
+    """
+    if not lang_model:
+        logging.error("Language detection model not loaded.")
+        return {'error': 'Language detection model not available.'}
+
+    cleaned_text = clean_text(original_text)
+    
+    # 1. كشف اللغة الأساسي للتعليق
+    lang_pred_tuple = lang_model.predict(cleaned_text, k=1)
+    detected_lang = lang_pred_tuple[0][0].replace('__label__', '') if lang_pred_tuple else 'und' # 'und' for undefined
+
+    final_text_for_sentiment = cleaned_text
+    sentiment_model_key = 'multilingual' # الافتراضي هو النموذج متعدد اللغات
+    
+    # 2. معالجة خاصة للهجات العربية
+    if detected_lang == 'ar':
+        final_text_for_sentiment = normalize_arabic_dialect(cleaned_text)
+        sentiment_model_key = 'ar'
+    elif detected_lang in SENTIMENT_MODELS: # للغات الأخرى المدعومة مباشرة
+        sentiment_model_key = detected_lang
+
+    sentiment_result = {'label': 'UNKNOWN', 'score': 0.0}
+    if sentiment_model_key in sentiment_pipelines:
+        try:
+            sentiment_output = sentiment_pipelines[sentiment_model_key](final_text_for_sentiment)[0]
+            sentiment_result = {
+                'label': sentiment_output['label'],
+                'score': round(sentiment_output['score'], 2)
+            }
+        except Exception as e:
+            logging.error(f"Error during sentiment analysis for '{original_text}' ({detected_lang}) with model {sentiment_model_key}: {e}")
+            sentiment_result = {'label': 'ERROR_SENTIMENT', 'score': 0.0}
+    else:
+        logging.warning(f"No specific sentiment model for {detected_lang}. Using multilingual if available or setting to UNSUPPORTED.")
+        if 'multilingual' in sentiment_pipelines:
+            try:
+                sentiment_output = sentiment_pipelines['multilingual'](final_text_for_sentiment)[0]
+                sentiment_result = {
+                    'label': sentiment_output['label'],
+                    'score': round(sentiment_output['score'], 2)
+                }
+            except Exception as e:
+                logging.error(f"Error with multilingual sentiment analysis for '{original_text}': {e}")
+                sentiment_result = {'label': 'ERROR_MULTILINGUAL', 'score': 0.0}
+        else:
+            sentiment_result = {'label': 'UNSUPPORTED_LANG', 'score': 0.0}
+
+    # 3. استخراج الكلمات المفتاحية
+    keywords = extract_keywords(final_text_for_sentiment, lang=detected_lang)
+
+    analysis_output = {
+        'original_text': original_text,
+        'processed_text': final_text_for_sentiment,
+        'detected_language': detected_lang,
+        'sentiment': sentiment_result['label'],
+        'confidence': sentiment_result['score'],
+        'keywords': keywords,
+        'segments_analysis': [] # لتحليل التعليقات الهجينة
+    }
+
+    # 4. معالجة التعليقات الهجينة (Code-Switching)
+    # نطبق هذا فقط إذا كانت اللغة الأساسية عربية أو إنجليزية، ووجدنا احتمال لتبديل الكود
+    # يمكن تحسين هذه الشرط بشكل أكبر
+    if detected_lang in ['ar', 'en'] and (re.search(r'[a-zA-Z]', original_text) and re.search(r'[\u0600-\u06FF]', original_text)):
+        segments = segment_hybrid_comment(original_text, lang_model)
+        if len(segments) > 1: # إذا تم الكشف عن أجزاء متعددة اللغات
+            hybrid_analysis = []
+            overall_segment_sentiments = []
+            for seg in segments:
+                seg_cleaned_text = clean_text(seg['text'])
+                seg_sentiment_model_key = seg['lang'] if seg['lang'] in sentiment_pipelines else 'multilingual'
+                
+                if seg_sentiment_model_key in sentiment_pipelines:
+                    try:
+                        seg_output = sentiment_pipelines[seg_sentiment_model_key](seg_cleaned_text)[0]
+                        hybrid_analysis.append({
+                            'segment_text': seg['text'],
+                            'segment_lang': seg['lang'],
+                            'segment_sentiment': seg_output['label'],
+                            'segment_confidence': round(seg_output['score'], 2)
+                        })
+                        overall_segment_sentiments.append(seg_output['label'].lower())
+                    except Exception as e:
+                        logging.error(f"Error analyzing segment '{seg['text']}' ({seg['lang']}): {e}")
+                else:
+                    hybrid_analysis.append({
+                        'segment_text': seg['text'],
+                        'segment_lang': seg['lang'],
+                        'segment_sentiment': 'UNSUPPORTED_SEG_LANG',
+                        'segment_confidence': 0.0
+                    })
+
+            analysis_output['segments_analysis'] = hybrid_analysis
+            
+            # تحديث المشاعر الكلية بناءً على تحليل الأجزاء
+            # يمكن تطوير هذا المنطق ليكون أكثر تعقيدًا (مثل الترجيح بالثقة)
+            if 'negative' in overall_segment_sentiments:
+                analysis_output['sentiment'] = 'MIXED_NEGATIVE'
+            elif 'positive' in overall_segment_sentiments and 'neutral' not in overall_segment_sentiments:
+                analysis_output['sentiment'] = 'MIXED_POSITIVE'
+            else:
+                analysis_output['sentiment'] = 'MIXED_NEUTRAL'
+
+    return analysis_output
+
+# -----------------------------------------------------------------------------
+# 7. مسارات Flask (Routes)
+# -----------------------------------------------------------------------------
+@app.route('/')
+def home():
+    recent_comments = db_manager.get_all_comments()[:10]
+    # تحويل ObjectId إلى string للتعامل معه في JSON
+    for comment in recent_comments:
+        comment['_id'] = str(comment['_id'])
+    return render_template('index.html', recent_comments=recent_comments)
+
+@app.route('/api/analyze', methods=['POST'])
+def api_analyze():
+    data = request.json
+    comments_input = data.get('comments', [])
+    
+    if not isinstance(comments_input, list):
+        return jsonify({'error': 'Input must be a list of comments.'}), 400
+
+    results = []
+    for comment_text in comments_input:
+        if isinstance(comment_text, str) and comment_text.strip():
+            analysis_result = analyze_single_comment_full(comment_text)
+            results.append(analysis_result)
+            db_manager.insert_comment_analysis(analysis_result)
+        else:
+            logging.warning(f"Skipping invalid comment input: {comment_text}")
+            results.append({'error': 'Invalid comment input', 'original_text': comment_text})
+
+    return jsonify({'results': results})
+
+@app.route('/api/comments', methods=['GET'])
+def get_comments():
+    comments = db_manager.get_all_comments()
+    for comment in comments:
+        comment['_id'] = str(comment['_id'])
+    return jsonify(comments)
+
+# -----------------------------------------------------------------------------
+# 8. نقطة البدء للتطبيق (Entry Point)
+# -----------------------------------------------------------------------------
+if __name__ == '__main__':
+    load_models() # تحميل النماذج عند بدء التطبيق
+    app.run(host='0.0.0.0', port=5000, debug=True)
